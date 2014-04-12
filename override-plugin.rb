@@ -5,43 +5,15 @@
 # hack that needs to be removed once the upstream plugin works with
 # alpha CoreOS images.
 
-require 'tempfile'
 require 'ipaddr'
 require Vagrant.source_root.join("plugins/guests/coreos/cap/configure_networks.rb")
 
-BASE_CLOUD_CONFIG = <<EOF
-#cloud-config
+UNIT = <<EOF
+[Match]
+Name=%s
 
-coreos:
-    units:
-      - name: coreos-cloudinit-vagrant-user.path
-        command: start
-        runtime: no
-        content: |
-          [Path]
-          PathExists=/var/lib/coreos-vagrant/vagrantfile-user-data
-      - name: coreos-cloudinit-vagrant-user.service
-        runtime: no
-        content: |
-          [Unit]
-          ConditionFileNotEmpty=/var/lib/coreos-vagrant/vagrantfile-user-data
-
-          [Service]
-          Type=oneshot
-          EnvironmentFile=/etc/environment
-          ExecStart=/usr/bin/coreos-cloudinit --from-file /var/lib/coreos-vagrant/vagrantfile-user-data
-          RemainAfterExit=yes
-EOF
-
-NETWORK_UNIT = <<EOF
-      - name: %s
-        runtime: no
-        content: |
-          [Match]
-          Name=%s
-
-          [Network]
-          Address=%s
+[Network]
+Address=%s
 EOF
 
 # Borrowed from http://stackoverflow.com/questions/1825928/netmask-to-cidr-in-ruby
@@ -58,7 +30,6 @@ module VagrantPlugins
         include Vagrant::Util
 
         def self.configure_networks(machine, networks)
-          cfg = BASE_CLOUD_CONFIG
           machine.communicate.tap do |comm|
 
             # Read network interface names
@@ -67,8 +38,6 @@ module VagrantPlugins
               interfaces = result.split("\n")
             end
 
-            ip = ""
-
             # Configure interfaces
             # FIXME: fix matching of interfaces with IP adresses
             networks.each do |network|
@@ -76,43 +45,28 @@ module VagrantPlugins
               iface_name = interfaces[iface_num]
               cidr = IPAddr.new('255.255.255.0').to_cidr
               address = "%s/%s" % [network[:ip], cidr]
-              unit_name = "50-%s.network" % [iface_name]
-              unit = NETWORK_UNIT % [unit_name, iface_name, address]
+              unit = UNIT % [iface_name, address]
+              comm.sudo("echo '%s' > /etc/systemd/network/%d-%s.network" % [unit, 10*iface_num, iface_name])
 
-              cfg = "#{cfg}#{unit}"
-              ip = network[:ip]
+              #TODO(bcwaldon): The following sed command is racy with the unit that initially
+              # populates /etc/environment. This line should be reenabled once that race is fixed.
+              #comm.sudo("sed -i -e '/^COREOS_PUBLIC_IPV4=/d' -e '/^COREOS_PRIVATE_IPV4=/d' '/etc/environment'")
+
+              comm.sudo("echo 'COREOS_PUBLIC_IPV4=#{network[:ip]}' >> /etc/environment")
+              comm.sudo("echo 'COREOS_PRIVATE_IPV4=#{network[:ip]}' >> /etc/environment")
             end
 
-            cfg = <<EOF
-#{cfg}
-write_files:
-  - path: /etc/environment
-    content: |
-      COREOS_PUBLIC_IPV4=#{ip}
-      COREOS_PRIVATE_IPV4=#{ip}
-
-hostname: #{machine.name}
-EOF
-
-            #TODO(bcwaldon): Remove `touch /etc/environment` once the following commit is released:
-            # https://github.com/coreos/coreos-overlay/commit/68f8f060f41a70a6120ac33e7866dbd2367dfec5
-            comm.sudo("touch /etc/environment")
-
-            temp = Tempfile.new("coreos-vagrant")
-            temp.write(cfg)
-            temp.close
-
-            comm.upload(temp.path, "/tmp/user-data")
-            comm.sudo("mkdir -p /var/lib/coreos-vagrant")
-            comm.sudo("mv /tmp/user-data /var/lib/coreos-vagrant/")
+            # This loads all of our network units we just created
+            comm.sudo("systemctl restart systemd-networkd")
 
           end
+
         end
       end
 
       class ChangeHostName
         def self.change_host_name(machine, name)
-          # This is handled in configure_networks
+            # do nothing!
         end
       end
     end
